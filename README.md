@@ -1,1 +1,126 @@
 # ibkr_project
+
+# -*- coding: utf-8 -*-
+"""
+60 日均线回调买入策略
+
+监控多只股票，当价格「回调至 60 日线以下，又回到 60 日线以上」时触发买入。
+信号定义：前一日收盘价 <= 60 日均线，当日收盘价 > 60 日均线。
+
+使用前需启动 TWS 或 IB Gateway，并开启 API。
+"""
+
+import os
+import sys
+from typing import List, Tuple, Optional
+
+# 添加 tushare_folder 到 path 以便导入 ibkr
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_parent_dir = os.path.dirname(_script_dir)
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+
+try:
+    import pandas as pd
+except ImportError:
+    raise ImportError("请安装 pandas: pip install pandas")
+
+
+# ============ 配置 ============
+# 监控的股票列表：(symbol, exchange, currency)
+# 美股示例
+WATCH_LIST: List[Tuple[str, str, str]] = [
+    ("AAPL", "SMART", "USD"),
+    ("MSFT", "SMART", "USD"),
+    ("GOOGL", "SMART", "USD"),
+]
+
+# 每只股票买入数量（股）
+BUY_QUANTITY = 100
+
+# 是否仅检测信号不实际下单（True=只打印信号，False=真实下单）
+DRY_RUN = True
+
+# 历史数据天数（需 >= 65 才能计算 60 日均线）
+HISTORY_DAYS = 90
+
+
+def fetch_daily_bars(client, symbol: str, exchange: str, currency: str) -> Optional[pd.DataFrame]:
+    """获取日 K 线数据。"""
+    try:
+        contract = client.get_stock_contract(symbol, exchange, currency)
+        bars = client.req_historical_data(
+            contract,
+            end_datetime="",
+            duration_str=f"{HISTORY_DAYS} D",
+            bar_size_setting="1 day",
+            what_to_show="TRADES",
+            use_rth=True,
+        )
+        if not bars:
+            return None
+        from ib_insync import util
+        df = util.df(bars)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"  [WARN] 获取 {symbol} 数据失败: {e}")
+        return None
+
+
+def compute_ma60_signal(df: pd.DataFrame) -> bool:
+    """
+    计算是否出现「回调至 60 日线以下，又回到 60 日线以上」信号。
+    即：前一日 close <= ma60，当日 close > ma60。
+    """
+    if df is None or len(df) < 61:
+        return False
+    df = df.copy()
+    df["ma60"] = df["close"].rolling(60).mean()
+    # 最后两行：昨日与今日
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    if pd.isna(prev["ma60"]) or pd.isna(last["ma60"]):
+        return False
+    # 昨日在 60 日线下方或附近，今日站上 60 日线
+    return prev["close"] <= prev["ma60"] and last["close"] > last["ma60"]
+
+
+def run_strategy():
+    """执行策略：检测信号并下单。"""
+    from ibkr import IbkrClient
+
+    client = IbkrClient()
+    if not client.connect():
+        print("连接 IBKR 失败，请检查 TWS/IB Gateway 是否已启动且 API 已开启。")
+        return
+
+    print("已连接 IBKR，开始检测 60 日线回调买入信号...\n")
+
+    for symbol, exchange, currency in WATCH_LIST:
+        print(f"检查 {symbol} ({exchange} {currency})...")
+        df = fetch_daily_bars(client, symbol, exchange, currency)
+        if df is None:
+            continue
+
+        if compute_ma60_signal(df):
+            print(f"  >>> 信号触发：{symbol} 回调至 60 日线以下后重新站上，执行买入")
+            if DRY_RUN:
+                print(f"  [DRY_RUN] 跳过实际下单，数量={BUY_QUANTITY}")
+            else:
+                try:
+                    contract = client.get_stock_contract(symbol, exchange, currency)
+                    trade = client.place_market_order(contract, "BUY", BUY_QUANTITY)
+                    print(f"  已下单: {trade}")
+                except Exception as e:
+                    print(f"  下单失败: {e}")
+        else:
+            print(f"  无信号")
+
+    client.disconnect()
+    print("\n检测完成。")
+
+
+if __name__ == "__main__":
+    run_strategy()
